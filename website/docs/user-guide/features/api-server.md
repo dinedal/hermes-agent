@@ -83,6 +83,23 @@ Standard OpenAI Chat Completions format. Stateless — the full conversation is 
 }
 ```
 
+**Inline image input:** `messages[].content` can also be an array containing `text` and `image_url` parts:
+
+```json
+{
+  "model": "hermes-agent",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png", "detail": "high"}}
+      ]
+    }
+  ]
+}
+```
+
 **Streaming** (`"stream": true`): Returns Server-Sent Events (SSE) with token-by-token response chunks. When streaming is enabled in config, tokens are emitted live as the LLM generates them. When disabled, the full response is sent as a single SSE chunk.
 
 **Tool progress in streams**: When the agent calls tools during a streaming request, brief progress indicators are injected into the content stream as the tools start executing (e.g. `` `💻 pwd` ``, `` `🔍 Python docs` ``). These appear as inline markdown before the agent's response text, giving frontends like Open WebUI real-time visibility into tool execution.
@@ -114,6 +131,23 @@ OpenAI Responses API format. Supports server-side conversation state via `previo
     {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Your project has..."}]}
   ],
   "usage": {"input_tokens": 50, "output_tokens": 200, "total_tokens": 250}
+}
+```
+
+**Inline image input:** `input[].content` can contain `input_text` and `input_image` parts. Remote image URLs and `data:image/...` URLs are supported:
+
+```json
+{
+  "model": "hermes-agent",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Describe this screenshot."},
+        {"type": "input_image", "image_url": "data:image/png;base64,QUFBQQ=="}
+      ]
+    }
+  ]
 }
 ```
 
@@ -194,6 +228,7 @@ The default bind address (`127.0.0.1`) is for local-only use. Browser access is 
 | `API_SERVER_KEY` | _(none)_ | Bearer token for auth |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
 | `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_MAX_REQUEST_BYTES` | `10485760` | Maximum JSON request size in bytes (default 10 MiB) |
 
 ### config.yaml
 
@@ -276,5 +311,5 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 ## Limitations
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
-- **No file upload** — vision/document analysis via uploaded files is not yet supported through the API.
+- **Uploads/documents still unsupported** — inline image inputs are supported, but uploaded files, `file_id`/`input_file`, PDFs, and other document inputs are not available through the API server yet.
 - **Model field is cosmetic** — the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml.

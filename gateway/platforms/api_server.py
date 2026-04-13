@@ -20,9 +20,13 @@ Requires:
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
+import socket as _socket
+import re
 import sqlite3
 import time
 import uuid
@@ -39,6 +43,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+    is_network_accessible,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +52,88 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_REQUEST_BYTES = 10 * 1024 * 1024  # 10 MiB default limit for POST bodies
+CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
+MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _normalize_chat_content(
+    content: Any, *, _max_depth: int = 10, _depth: int = 0,
+) -> str:
+    """Normalize OpenAI chat message content into a plain text string.
+
+    Some clients (Open WebUI, LobeChat, etc.) send content as an array of
+    typed parts instead of a plain string::
+
+        [{"type": "text", "text": "hello"}, {"type": "input_text", "text": "..."}]
+
+    This function flattens those into a single string so the agent pipeline
+    (which expects strings) doesn't choke.
+
+    Defensive limits prevent abuse: recursion depth, list size, and output
+    length are all bounded.
+    """
+    if _depth > _max_depth:
+        return ""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+        for item in items:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item[:MAX_NORMALIZED_TEXT_LENGTH])
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in {"text", "input_text", "output_text"}:
+                    text = item.get("text", "")
+                    if text:
+                        try:
+                            parts.append(str(text)[:MAX_NORMALIZED_TEXT_LENGTH])
+                        except Exception:
+                            pass
+                # Silently skip image_url / other non-text parts
+            elif isinstance(item, list):
+                nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
+                if nested:
+                    parts.append(nested)
+            # Check accumulated size
+            if sum(len(p) for p in parts) >= MAX_NORMALIZED_TEXT_LENGTH:
+                break
+        result = "\n".join(parts)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+
+    # Fallback for unexpected types (int, float, bool, etc.)
+    try:
+        result = str(content)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+    except Exception:
+        return ""
+
+
+class _APIRequestError(Exception):
+    """Structured request validation error for OpenAI-style responses."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        param: str = None,
+        code: str = None,
+        status: int = 400,
+        err_type: str = "invalid_request_error",
+    ):
+        super().__init__(message)
+        self.message = message
+        self.param = param
+        self.code = code
+        self.status = status
+        self.err_type = err_type
 
 
 def check_api_server_requirements() -> bool:
@@ -214,10 +300,12 @@ if AIOHTTP_AVAILABLE:
     async def body_limit_middleware(request, handler):
         """Reject overly large request bodies early based on Content-Length."""
         if request.method in ("POST", "PUT", "PATCH"):
+            adapter = request.app.get("api_server_adapter")
+            max_request_bytes = getattr(adapter, "_max_request_bytes", MAX_REQUEST_BYTES)
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    if int(cl) > max_request_bytes:
                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
@@ -281,6 +369,24 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _derive_chat_session_id(
+    system_prompt: Optional[str],
+    first_user_message: str,
+) -> str:
+    """Derive a stable session ID from the conversation's first user message.
+
+    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
+    conversation history with every request.  The system prompt and first user
+    message are constant across all turns of the same conversation, so hashing
+    them produces a deterministic session ID that lets the API server reuse
+    the same Hermes session (and therefore the same Docker container sandbox
+    directory) across turns.
+    """
+    seed = f"{system_prompt or ''}\n{first_user_message}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"api-{digest}"
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -297,6 +403,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
+        )
+        self._model_name: str = self._resolve_model_name(
+            extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
+        self._max_request_bytes: int = self._parse_positive_int(
+            extra.get("max_request_bytes", os.getenv("API_SERVER_MAX_REQUEST_BYTES")),
+            default=MAX_REQUEST_BYTES,
+            setting_name="API_SERVER_MAX_REQUEST_BYTES",
         )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -322,6 +436,26 @@ class APIServerAdapter(BasePlatformAdapter):
             items = [str(value)]
 
         return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @staticmethod
+    def _resolve_model_name(explicit: str) -> str:
+        """Derive the advertised model name for /v1/models.
+
+        Priority:
+        1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
+        2. Active profile name (so each profile advertises a distinct model)
+        3. Fallback: "hermes-agent"
+        """
+        if explicit and explicit.strip():
+            return explicit.strip()
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile and profile not in ("default", "custom"):
+                return profile
+        except Exception:
+            pass
+        return "hermes-agent"
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -353,6 +487,279 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return "*" in self._cors_origins or origin in self._cors_origins
 
+    @staticmethod
+    def _parse_positive_int(value: Any, *, default: int, setting_name: str) -> int:
+        """Parse a positive integer setting, falling back to a safe default."""
+        if value in (None, ""):
+            return default
+
+        if isinstance(value, str):
+            candidate = value.strip().replace("_", "")
+        else:
+            candidate = value
+
+        try:
+            parsed = int(candidate)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using default %d", setting_name, value, default)
+            return default
+
+        if parsed <= 0:
+            logger.warning("Invalid %s=%r; using default %d", setting_name, value, default)
+            return default
+
+        return parsed
+
+    @staticmethod
+    def _error_response(error: "_APIRequestError") -> "web.Response":
+        """Convert a structured validation error into an OpenAI-style HTTP response."""
+        return web.json_response(
+            _openai_error(
+                error.message,
+                err_type=error.err_type,
+                param=error.param,
+                code=error.code,
+            ),
+            status=error.status,
+        )
+
+    async def _parse_json_body(self, request: "web.Request") -> Dict[str, Any]:
+        """Parse the request body and return OpenAI-style errors for common failures."""
+        try:
+            return await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            raise _APIRequestError("Request body too large.", code="body_too_large", status=413)
+        except (json.JSONDecodeError, Exception):
+            raise _APIRequestError("Invalid JSON in request body")
+
+    @staticmethod
+    def _is_supported_image_source(source: Any) -> bool:
+        """Allow remote http(s) URLs and inline data:image/... URLs."""
+        if not isinstance(source, str):
+            return False
+
+        candidate = source.strip()
+        lowered = candidate.lower()
+        if lowered.startswith("http://") or lowered.startswith("https://"):
+            return True
+        if lowered.startswith("data:image/") and "," in candidate:
+            return True
+        return False
+
+    @staticmethod
+    def _extract_image_payload(
+        image_value: Any,
+        *,
+        detail: Any = None,
+        param_prefix: str,
+    ) -> Dict[str, Any]:
+        """Validate an image payload and normalize it to {'url', 'detail'?}."""
+        image_detail = detail
+        if isinstance(image_value, dict):
+            image_detail = image_value.get("detail", image_detail)
+            image_value = image_value.get("url")
+
+        if not isinstance(image_value, str) or not image_value.strip():
+            raise _APIRequestError(
+                "Image content parts must include a non-empty image URL.",
+                param=param_prefix,
+                code="invalid_image_url",
+            )
+
+        image_url = image_value.strip()
+        if not APIServerAdapter._is_supported_image_source(image_url):
+            lowered = image_url.lower()
+            if lowered.startswith("data:") and not lowered.startswith("data:image/"):
+                raise _APIRequestError(
+                    "Only image data URLs are supported. Uploaded files and non-image data payloads are not supported.",
+                    param=param_prefix,
+                    code="unsupported_content_type",
+                )
+            raise _APIRequestError(
+                "Image inputs must use http(s) URLs or data:image/... URLs.",
+                param=param_prefix,
+                code="invalid_image_url",
+            )
+
+        normalized = {"url": image_url}
+        if image_detail is not None:
+            if not isinstance(image_detail, str) or not image_detail.strip():
+                raise _APIRequestError(
+                    "Image detail must be a non-empty string when provided.",
+                    param=f"{param_prefix}.detail",
+                    code="invalid_detail",
+                )
+            normalized["detail"] = image_detail.strip()
+        return normalized
+
+    def _normalize_chat_content(self, content: Any, *, param_prefix: str) -> Any:
+        """Validate Chat Completions content and preserve text/image parts."""
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if not isinstance(content, list):
+            raise _APIRequestError(
+                "Chat message content must be a string or an array of content parts.",
+                param=param_prefix,
+                code="invalid_content",
+            )
+
+        normalized_parts: List[Dict[str, Any]] = []
+        for idx, part in enumerate(content):
+            part_param = f"{param_prefix}[{idx}]"
+            if not isinstance(part, dict):
+                raise _APIRequestError(
+                    "Each chat content part must be an object.",
+                    param=part_param,
+                    code="invalid_content_part",
+                )
+
+            part_type = part.get("type")
+            if part_type == "text":
+                text = part.get("text")
+                if not isinstance(text, str):
+                    raise _APIRequestError(
+                        "Text content parts must include a string 'text' field.",
+                        param=f"{part_param}.text",
+                        code="invalid_content_part",
+                    )
+                normalized_parts.append({"type": "text", "text": text})
+                continue
+
+            if part_type == "image_url":
+                normalized_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": self._extract_image_payload(
+                            part.get("image_url"),
+                            detail=part.get("detail"),
+                            param_prefix=f"{part_param}.image_url",
+                        ),
+                    }
+                )
+                continue
+
+            if part_type in {"file", "input_file"}:
+                raise _APIRequestError(
+                    "Inline image inputs are supported, but uploaded files and document inputs are not supported on this endpoint.",
+                    param=f"{part_param}.type",
+                    code="unsupported_content_type",
+                )
+
+            raise _APIRequestError(
+                "Unsupported chat content part type. Only 'text' and 'image_url' are supported.",
+                param=f"{part_param}.type",
+                code="unsupported_content_type",
+            )
+
+        return normalized_parts
+
+    def _system_content_to_text(self, content: Any, *, param_prefix: str) -> str:
+        """Flatten system content to text while rejecting non-text multimodal parts."""
+        normalized = self._normalize_chat_content(content, param_prefix=param_prefix)
+        if isinstance(normalized, str):
+            return normalized
+
+        text_parts: List[str] = []
+        for idx, part in enumerate(normalized):
+            if part.get("type") != "text":
+                raise _APIRequestError(
+                    "System messages only support text content.",
+                    param=f"{param_prefix}[{idx}].type",
+                    code="unsupported_content_type",
+                )
+            text_parts.append(part.get("text", ""))
+        return "\n".join(text_parts)
+
+    def _normalize_responses_content(self, content: Any, *, param_prefix: str) -> Any:
+        """Normalize Responses API content to Hermes's internal chat-style format."""
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if not isinstance(content, list):
+            raise _APIRequestError(
+                "Responses input content must be a string or an array of content parts.",
+                param=param_prefix,
+                code="invalid_content",
+            )
+
+        normalized_parts: List[Dict[str, Any]] = []
+        for idx, part in enumerate(content):
+            part_param = f"{param_prefix}[{idx}]"
+            if isinstance(part, str):
+                normalized_parts.append({"type": "text", "text": part})
+                continue
+
+            if not isinstance(part, dict):
+                raise _APIRequestError(
+                    "Each responses content part must be an object.",
+                    param=part_param,
+                    code="invalid_content_part",
+                )
+
+            part_type = part.get("type")
+            if part_type in {"input_text", "output_text", "text"}:
+                text = part.get("text")
+                if not isinstance(text, str):
+                    raise _APIRequestError(
+                        "Text content parts must include a string 'text' field.",
+                        param=f"{part_param}.text",
+                        code="invalid_content_part",
+                    )
+                normalized_parts.append({"type": "text", "text": text})
+                continue
+
+            if part_type in {"input_image", "image_url"}:
+                normalized_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": self._extract_image_payload(
+                            part.get("image_url"),
+                            detail=part.get("detail"),
+                            param_prefix=f"{part_param}.image_url",
+                        ),
+                    }
+                )
+                continue
+
+            if part_type in {"input_file", "file"}:
+                raise _APIRequestError(
+                    "Inline image inputs are supported, but uploaded files and document inputs are not supported on this endpoint.",
+                    param=f"{part_param}.type",
+                    code="unsupported_content_type",
+                )
+
+            raise _APIRequestError(
+                "Unsupported responses content part type. Only 'input_text' and 'input_image' are supported.",
+                param=f"{part_param}.type",
+                code="unsupported_content_type",
+            )
+
+        return normalized_parts
+
+    @staticmethod
+    def _content_has_visible_payload(content: Any) -> bool:
+        """True when content contains text or at least one image attachment."""
+        if isinstance(content, str):
+            return bool(content.strip())
+        if not isinstance(content, list):
+            return False
+
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                return True
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type in {"text", "input_text", "output_text"} and str(part.get("text", "") or "").strip():
+                return True
+            if part_type in {"image_url", "input_image"}:
+                return True
+
+        return False
+
     # ------------------------------------------------------------------
     # Auth helper
     # ------------------------------------------------------------------
@@ -362,7 +769,8 @@ class APIServerAdapter(BasePlatformAdapter):
         Validate Bearer token from Authorization header.
 
         Returns None if auth is OK, or a 401 web.Response on failure.
-        If no API key is configured, all requests are allowed.
+        If no API key is configured, all requests are allowed (only when API
+        server is local).
         """
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
@@ -370,7 +778,7 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if token == self._api_key:
+            if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
 
         return web.json_response(
@@ -467,12 +875,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": [
                 {
-                    "id": "hermes-agent",
+                    "id": self._model_name,
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "hermes",
                     "permission": [],
-                    "root": "hermes-agent",
+                    "root": self._model_name,
                     "parent": None,
                 }
             ],
@@ -486,9 +894,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Parse request body
         try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+            body = await self._parse_json_body(request)
+        except _APIRequestError as error:
+            return self._error_response(error)
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -501,28 +909,48 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
+        conversation_messages: List[Dict[str, Any]] = []
+        try:
+            for idx, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    raise _APIRequestError(
+                        "Each chat message must be an object.",
+                        param=f"messages[{idx}]",
+                        code="invalid_message",
+                    )
 
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                # Accumulate system messages
-                if system_prompt is None:
-                    system_prompt = content
-                else:
-                    system_prompt = system_prompt + "\n" + content
-            elif role in ("user", "assistant"):
-                conversation_messages.append({"role": role, "content": content})
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "system":
+                    normalized_system = self._system_content_to_text(
+                        content,
+                        param_prefix=f"messages[{idx}].content",
+                    )
+                    if system_prompt is None:
+                        system_prompt = normalized_system
+                    else:
+                        system_prompt = system_prompt + "\n" + normalized_system
+                elif role in ("user", "assistant"):
+                    conversation_messages.append(
+                        {
+                            "role": role,
+                            "content": self._normalize_chat_content(
+                                content,
+                                param_prefix=f"messages[{idx}].content",
+                            ),
+                        }
+                    )
+        except _APIRequestError as error:
+            return self._error_response(error)
 
         # Extract the last user message as the primary input
-        user_message = ""
+        user_message: Any = ""
         history = []
         if conversation_messages:
             user_message = conversation_messages[-1].get("content", "")
             history = conversation_messages[:-1]
 
-        if not user_message:
+        if not self._content_has_visible_payload(user_message):
             return web.json_response(
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
@@ -530,8 +958,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
+        #
+        # Security: session continuation exposes conversation history, so it is
+        # only allowed when the API key is configured and the request is
+        # authenticated.  Without this gate, any unauthenticated client could
+        # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity."
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure API_SERVER_KEY to enable this feature."
+                    ),
+                    status=403,
+                )
+            # Sanitize: reject control characters that could enable header injection.
+            if re.search(r'[\r\n\x00]', provided_session_id):
+                return web.json_response(
+                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    status=400,
+                )
             session_id = provided_session_id
             try:
                 db = self._ensure_session_db()
@@ -541,11 +993,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            session_id = str(uuid.uuid4())
+            # Derive a stable session ID from the conversation fingerprint so
+            # that consecutive messages from the same Open WebUI (or similar)
+            # conversation map to the same Hermes session.  The first user
+            # message + system prompt are constant across all turns.
+            first_user = ""
+            for cm in conversation_messages:
+                if cm.get("role") == "user":
+                    first_user = cm.get("content", "")
+                    break
+            session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", "hermes-agent")
+        model_name = body.get("model", self._model_name)
         created = int(time.time())
 
         if stream:
@@ -563,14 +1024,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(name, preview, args):
-                """Inject tool progress into the SSE stream for Open WebUI."""
+            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                """Send tool progress as a separate SSE event.
+
+                Previously, progress markers like ``⏰ list`` were injected
+                directly into ``delta.content``.  OpenAI-compatible frontends
+                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
+                the assistant message and send it back on subsequent requests.
+                After enough turns the model learns to *emit* the markers as
+                plain text instead of issuing real tool calls — silently
+                hallucinating tool results.  See #6972.
+
+                The fix: push a tagged tuple ``("__tool_progress__", payload)``
+                onto the stream queue.  The SSE writer emits it as a custom
+                ``event: hermes.tool.progress`` line that compliant frontends
+                can render for UX but will *not* persist into conversation
+                history.  Clients that don't understand the custom event type
+                silently ignore it per the SSE specification.
+                """
+                if event_type != "tool.started":
+                    return
                 if name.startswith("_"):
-                    return  # Skip internal events (_thinking)
+                    return
                 from agent.display import get_tool_emoji
                 emoji = get_tool_emoji(name)
                 label = preview or name
-                _stream_q.put(f"\n`{emoji} {label}`\n")
+                _stream_q.put(("__tool_progress__", {
+                    "tool": name,
+                    "emoji": emoji,
+                    "label": label,
+                }))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -660,7 +1143,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         import queue as _q
 
-        sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
         # CORS middleware can't inject headers into StreamResponse after
         # prepare() flushes them, so resolve CORS headers up front.
         origin = request.headers.get("Origin", "")
@@ -673,6 +1160,8 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
+            last_activity = time.monotonic()
+
             # Role chunk
             role_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -680,6 +1169,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+            last_activity = time.monotonic()
+
+            # Helper — route a queue item to the correct SSE event.
+            async def _emit(item):
+                """Write a single queue item to the SSE stream.
+
+                Plain strings are sent as normal ``delta.content`` chunks.
+                Tagged tuples ``("__tool_progress__", payload)`` are sent
+                as a custom ``event: hermes.tool.progress`` SSE event so
+                frontends can display them without storing the markers in
+                conversation history.  See #6972.
+                """
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                else:
+                    content_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
@@ -694,26 +1208,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
-                                content_chunk = {
-                                    "id": completion_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                                }
-                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                last_activity = await _emit(delta)
                             except _q.Empty:
                                 break
                         break
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
                     continue
 
                 if delta is None:  # End of stream sentinel
                     break
 
-                content_chunk = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                }
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                last_activity = await _emit(delta)
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -764,12 +1271,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Parse request body
         try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response(
-                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
-                status=400,
-            )
+            body = await self._parse_json_body(request)
+        except _APIRequestError as error:
+            return self._error_response(error)
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -790,34 +1294,71 @@ class APIServerAdapter(BasePlatformAdapter):
             # No error if conversation doesn't exist yet — it's a new conversation
 
         # Normalize input to message list
-        input_messages: List[Dict[str, str]] = []
-        if isinstance(raw_input, str):
-            input_messages = [{"role": "user", "content": raw_input}]
-        elif isinstance(raw_input, list):
-            for item in raw_input:
-                if isinstance(item, str):
-                    input_messages.append({"role": "user", "content": item})
-                elif isinstance(item, dict):
-                    role = item.get("role", "user")
-                    content = item.get("content", "")
-                    # Handle content that may be a list of content parts
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "input_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, dict) and part.get("type") == "output_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "\n".join(text_parts)
-                    input_messages.append({"role": role, "content": content})
-        else:
-            return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+        input_messages: List[Dict[str, Any]] = []
+        try:
+            if isinstance(raw_input, str):
+                input_messages = [{"role": "user", "content": raw_input}]
+            elif isinstance(raw_input, list):
+                for idx, item in enumerate(raw_input):
+                    if isinstance(item, str):
+                        input_messages.append({"role": "user", "content": item})
+                    elif isinstance(item, dict):
+                        role = item.get("role", "user")
+                        if not isinstance(role, str) or not role.strip():
+                            role = "user"
+                        input_messages.append(
+                            {
+                                "role": role,
+                                "content": self._normalize_responses_content(
+                                    item.get("content", ""),
+                                    param_prefix=f"input[{idx}].content",
+                                ),
+                            }
+                        )
+                    else:
+                        raise _APIRequestError(
+                            "'input' array items must be strings or message objects.",
+                            param=f"input[{idx}]",
+                            code="invalid_input",
+                        )
+            else:
+                raise _APIRequestError("'input' must be a string or array", code="invalid_input")
+        except _APIRequestError as error:
+            return self._error_response(error)
 
-        # Reconstruct conversation history from previous_response_id
-        conversation_history: List[Dict[str, str]] = []
-        if previous_response_id:
+        # Accept explicit conversation_history from the request body.
+        # This lets stateless clients supply their own history instead of
+        # relying on server-side response chaining via previous_response_id.
+        # Precedence: explicit conversation_history > previous_response_id.
+        conversation_history: List[Dict[str, Any]] = []
+        raw_history = body.get("conversation_history")
+        if raw_history:
+            if not isinstance(raw_history, list):
+                return web.json_response(
+                    _openai_error("'conversation_history' must be an array of message objects"),
+                    status=400,
+                )
+            for i, entry in enumerate(raw_history):
+                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                    return web.json_response(
+                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        status=400,
+                    )
+                role = entry["role"]
+                if not isinstance(role, str) or not role.strip():
+                    role = "user"
+                try:
+                    normalized_content = self._normalize_responses_content(
+                        entry["content"],
+                        param_prefix=f"conversation_history[{i}].content",
+                    )
+                except _APIRequestError as error:
+                    return self._error_response(error)
+                conversation_history.append({"role": role, "content": normalized_content})
+            if previous_response_id:
+                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+
+        if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
@@ -831,8 +1372,8 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history.append(msg)
 
         # Last input message is the user_message
-        user_message = input_messages[-1].get("content", "") if input_messages else ""
-        if not user_message:
+        user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
+        if not self._content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         # Truncation support
@@ -900,7 +1441,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", "hermes-agent"),
+            "model": body.get("model", self._model_name),
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -1262,8 +1803,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _run_agent(
         self,
-        user_message: str,
-        conversation_history: List[Dict[str, str]],
+        user_message: Any,
+        conversation_history: List[Dict[str, Any]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
@@ -1295,6 +1836,7 @@ class APIServerAdapter(BasePlatformAdapter):
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                task_id="default",
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1403,13 +1945,48 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+
+        # Accept explicit conversation_history from the request body.
+        # Precedence: explicit conversation_history > previous_response_id.
         conversation_history: List[Dict[str, str]] = []
-        if previous_response_id:
+        raw_history = body.get("conversation_history")
+        if raw_history:
+            if not isinstance(raw_history, list):
+                return web.json_response(
+                    _openai_error("'conversation_history' must be an array of message objects"),
+                    status=400,
+                )
+            for i, entry in enumerate(raw_history):
+                if not isinstance(entry, dict) or "role" not in entry or "content" not in entry:
+                    return web.json_response(
+                        _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
+                        status=400,
+                    )
+                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+            if previous_response_id:
+                logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
+
+        if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 if instructions is None:
                     instructions = stored.get("instructions")
+
+        # When input is a multi-message array, extract all but the last
+        # message as conversation history (the last becomes user_message).
+        # Only fires when no explicit history was provided.
+        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+            for msg in raw_input[:-1]:
+                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        # Flatten multi-part content blocks to text
+                        content = " ".join(
+                            part.get("text", "") for part in content
+                            if isinstance(part, dict) and part.get("type") == "text"
+                        )
+                    conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or run_id
         ephemeral_system_prompt = instructions
@@ -1426,6 +2003,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     r = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
+                        task_id="default",
                     )
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1547,7 +2125,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
+            self._app = web.Application(middlewares=mws, client_max_size=self._max_request_bytes)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
@@ -1577,8 +2155,33 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # Refuse to start network-accessible without authentication
+            if is_network_accessible(self._host) and not self._api_key:
+                logger.error(
+                    "[%s] Refusing to start: binding to %s requires API_SERVER_KEY. "
+                    "Set API_SERVER_KEY or use the default 127.0.0.1.",
+                    self.name, self._host,
+                )
+                return False
+
+            # Refuse to start network-accessible with a placeholder key.
+            # Ported from openclaw/openclaw#64586.
+            if is_network_accessible(self._host) and self._api_key:
+                try:
+                    from hermes_cli.auth import has_usable_secret
+                    if not has_usable_secret(self._api_key, min_length=8):
+                        logger.error(
+                            "[%s] Refusing to start: API_SERVER_KEY is set to a "
+                            "placeholder value. Generate a real secret "
+                            "(e.g. `openssl rand -hex 32`) and set API_SERVER_KEY "
+                            "before exposing the API server on %s.",
+                            self.name, self._host,
+                        )
+                        return False
+                except ImportError:
+                    pass
+
             # Port conflict detection — fail fast if port is already in use
-            import socket as _socket
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
@@ -1594,9 +2197,17 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._site.start()
 
             self._mark_connected()
+            if not self._api_key:
+                logger.warning(
+                    "[%s] ⚠️  No API key configured (API_SERVER_KEY / platforms.api_server.key). "
+                    "All requests will be accepted without authentication. "
+                    "Set an API key for production deployments to prevent "
+                    "unauthorized access to sessions, responses, and cron jobs.",
+                    self.name,
+                )
             logger.info(
-                "[%s] API server listening on http://%s:%d",
-                self.name, self._host, self._port,
+                "[%s] API server listening on http://%s:%d (model: %s)",
+                self.name, self._host, self._port, self._model_name,
             )
             return True
 
